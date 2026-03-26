@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lyx-claude"
+version = "0.1.0"
+description = "Claude AI sidecar for LyX"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.scripts]
+lyx-claude = "lyx_claude.main:main"
