@@ -1,17 +1,20 @@
 """PySide6 chat UI for LyX-Claude sidecar."""
 
+import sys
+import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Slot, QTimer
+from PySide6.QtCore import Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QAction, QFont, QFontDatabase, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
-    QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
-    QToolBar, QTreeWidget, QTreeWidgetItem,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QStatusBar, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .document import DocumentManager
+from .edits import EditProposal, apply_edit
 from .engine import ConversationEngine
 
 
@@ -89,6 +92,189 @@ class FileTree(QTreeWidget):
                 return
 
 
+class EditProposalCard(QFrame):
+    """Card showing a single edit proposal with diff and Accept/Reject buttons."""
+
+    accepted = Signal(object)   # emits the EditProposal
+    rejected = Signal(object)   # emits the EditProposal
+
+    _OLD_STYLE = "background-color: #3c1f1f; color: #f8d7da; padding: 6px; border-radius: 3px;"
+    _NEW_STYLE = "background-color: #1f3c1f; color: #d4edda; padding: 6px; border-radius: 3px;"
+    _RESOLVED_STYLE = "background-color: #2a2a2a; color: #888;"
+
+    def __init__(self, proposal: EditProposal, parent=None):
+        super().__init__(parent)
+        self._proposal = proposal
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        self.setStyleSheet("EditProposalCard { border: 1px solid #555; border-radius: 4px; padding: 4px; }")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+
+        # Header: file name + buttons
+        header = QHBoxLayout()
+        file_label = QLabel(f"<b>{proposal.file_path}</b>")
+        file_label.setStyleSheet("color: #ccc;")
+        header.addWidget(file_label, stretch=1)
+
+        self._accept_btn = QPushButton("Accept")
+        self._accept_btn.setFixedWidth(70)
+        self._accept_btn.setStyleSheet("background-color: #2e7d32; color: white; border-radius: 3px; padding: 3px;")
+        self._accept_btn.clicked.connect(self._on_accept)
+        header.addWidget(self._accept_btn)
+
+        self._reject_btn = QPushButton("Reject")
+        self._reject_btn.setFixedWidth(70)
+        self._reject_btn.setStyleSheet("background-color: #c62828; color: white; border-radius: 3px; padding: 3px;")
+        self._reject_btn.clicked.connect(self._on_reject)
+        header.addWidget(self._reject_btn)
+
+        layout.addLayout(header)
+
+        # Old text (red)
+        self._old_label = QLabel(self._truncate(proposal.old_text))
+        self._old_label.setFont(_mono_font(9))
+        self._old_label.setWordWrap(True)
+        self._old_label.setStyleSheet(self._OLD_STYLE)
+        self._old_label.setTextFormat(Qt.PlainText)
+        layout.addWidget(self._old_label)
+
+        # Arrow
+        arrow = QLabel("\u2193")  # ↓
+        arrow.setAlignment(Qt.AlignCenter)
+        arrow.setStyleSheet("color: #888; font-size: 14px;")
+        layout.addWidget(arrow)
+
+        # New text (green)
+        self._new_label = QLabel(self._truncate(proposal.new_text))
+        self._new_label.setFont(_mono_font(9))
+        self._new_label.setWordWrap(True)
+        self._new_label.setStyleSheet(self._NEW_STYLE)
+        self._new_label.setTextFormat(Qt.PlainText)
+        layout.addWidget(self._new_label)
+
+        # Status label (hidden until resolved)
+        self._status_label = QLabel()
+        self._status_label.setAlignment(Qt.AlignCenter)
+        self._status_label.setStyleSheet("color: #888; padding: 4px;")
+        self._status_label.hide()
+        layout.addWidget(self._status_label)
+
+    @staticmethod
+    def _truncate(text: str, max_lines: int = 15) -> str:
+        lines = text.split("\n")
+        if len(lines) > max_lines:
+            return "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} more lines)"
+        return text
+
+    def _on_accept(self):
+        self._proposal.status = "accepted"
+        self._resolve("Accepted")
+        self.accepted.emit(self._proposal)
+
+    def _on_reject(self):
+        self._proposal.status = "rejected"
+        self._resolve("Rejected")
+        self.rejected.emit(self._proposal)
+
+    def _resolve(self, label: str):
+        self._accept_btn.hide()
+        self._reject_btn.hide()
+        self._old_label.setStyleSheet(self._RESOLVED_STYLE)
+        self._new_label.setStyleSheet(self._RESOLVED_STYLE)
+        self._status_label.setText(label)
+        self._status_label.show()
+
+
+class EditPanel(QWidget):
+    """Collapsible panel that holds edit proposal cards."""
+
+    all_resolved = Signal()  # emitted when every card has been accepted or rejected
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cards: list[EditProposalCard] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(2)
+
+        # Header bar
+        header = QHBoxLayout()
+        title = QLabel("<b>Proposed Edits</b>")
+        title.setStyleSheet("color: #ddd; padding: 2px;")
+        header.addWidget(title, stretch=1)
+
+        self._accept_all_btn = QPushButton("Accept All")
+        self._accept_all_btn.setFixedWidth(90)
+        self._accept_all_btn.setStyleSheet("background-color: #2e7d32; color: white; border-radius: 3px; padding: 3px;")
+        self._accept_all_btn.clicked.connect(self._accept_all)
+        header.addWidget(self._accept_all_btn)
+
+        self._reject_all_btn = QPushButton("Reject All")
+        self._reject_all_btn.setFixedWidth(90)
+        self._reject_all_btn.setStyleSheet("background-color: #c62828; color: white; border-radius: 3px; padding: 3px;")
+        self._reject_all_btn.clicked.connect(self._reject_all)
+        header.addWidget(self._reject_all_btn)
+
+        layout.addLayout(header)
+
+        # Scroll area for cards
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setMaximumHeight(300)
+        self._scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        self._card_container = QWidget()
+        self._card_layout = QVBoxLayout(self._card_container)
+        self._card_layout.setContentsMargins(0, 0, 0, 0)
+        self._card_layout.setSpacing(6)
+        self._card_layout.addStretch()
+        self._scroll.setWidget(self._card_container)
+
+        layout.addWidget(self._scroll)
+
+        self.hide()
+
+    def show_proposals(self, proposals: list):
+        """Display a new batch of edit proposals."""
+        self._clear_cards()
+
+        for proposal in proposals:
+            card = EditProposalCard(proposal)
+            card.accepted.connect(self._on_card_resolved)
+            card.rejected.connect(self._on_card_resolved)
+            self._cards.append(card)
+            # Insert before the stretch
+            self._card_layout.insertWidget(self._card_layout.count() - 1, card)
+
+        self.show()
+
+    def _clear_cards(self):
+        for card in self._cards:
+            self._card_layout.removeWidget(card)
+            card.deleteLater()
+        self._cards.clear()
+
+    def _on_card_resolved(self, proposal):
+        # Check if all are resolved
+        if all(c._proposal.status != "pending" for c in self._cards):
+            self._accept_all_btn.hide()
+            self._reject_all_btn.hide()
+            self.all_resolved.emit()
+
+    def _accept_all(self):
+        for card in self._cards:
+            if card._proposal.status == "pending":
+                card._on_accept()
+
+    def _reject_all(self):
+        for card in self._cards:
+            if card._proposal.status == "pending":
+                card._on_reject()
+
+
 class MainWindow(QMainWindow):
     """Main chat window with project file sidebar."""
 
@@ -101,9 +287,11 @@ class MainWindow(QMainWindow):
 
         self._doc_manager = DocumentManager(self)
         self._engine = ConversationEngine(self)
+        self._bridge = None  # set via set_bridge() if pipe integration is enabled
 
         # Streaming text buffer — flushed on timer
         self._pending_text = ""
+        self._has_received_text = False
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(self.FLUSH_INTERVAL_MS)
         self._flush_timer.timeout.connect(self._flush_pending)
@@ -182,6 +370,10 @@ class MainWindow(QMainWindow):
         self._chat_display.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         chat_layout.addWidget(self._chat_display, stretch=1)
 
+        # Edit proposal panel (hidden until proposals arrive)
+        self._edit_panel = EditPanel()
+        chat_layout.addWidget(self._edit_panel)
+
         # Input area
         input_layout = QHBoxLayout()
         self._chat_input = ChatInput(self._send_message)
@@ -195,6 +387,19 @@ class MainWindow(QMainWindow):
 
         chat_layout.addLayout(input_layout)
 
+        # Command bar — keyboard shortcut hints
+        cmd_bar = QLabel(
+            "Enter Send  |  Shift+Enter Newline  |  "
+            "Ctrl+R Refresh  |  Ctrl+O Open file  |  "
+            "Ctrl+Shift+O Open project"
+        )
+        cmd_bar.setStyleSheet(
+            "color: #777; background-color: #1a1a1a; padding: 3px 8px;"
+            "border-top: 1px solid #333; font-size: 9pt;"
+        )
+        cmd_bar.setAlignment(Qt.AlignCenter)
+        chat_layout.addWidget(cmd_bar)
+
         splitter.addWidget(chat_panel)
         splitter.setSizes([220, 700])
 
@@ -203,11 +408,47 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._status.showMessage("Ready")
 
+        # Permanent LyX connection indicator (right side of status bar)
+        self._bridge_label = QLabel("LyX: No pipe")
+        self._bridge_label.setStyleSheet("color: #888; padding: 2px 8px;")
+        self._status.addPermanentWidget(self._bridge_label)
+
     def _connect_signals(self):
         self._engine.streaming_chunk.connect(self._on_chunk)
         self._engine.response_finished.connect(self._on_response_done)
         self._engine.response_error.connect(self._on_error)
+        self._engine.edits_proposed.connect(self._on_edits_proposed)
+        self._engine.parse_debug.connect(self._on_parse_debug)
         self._doc_manager.content_changed.connect(self._on_doc_changed)
+        self._edit_panel.all_resolved.connect(self._on_edits_resolved)
+
+    # --- LyX pipe bridge ---
+
+    def set_bridge(self, bridge):
+        """Enable live LyX pipe integration."""
+        self._bridge = bridge
+        self._bridge_label.setText("LyX: Disconnected")
+        self._bridge_label.setStyleSheet("color: #f44336; padding: 2px 8px;")
+        bridge.connection_changed.connect(self._on_bridge_connection)
+        bridge.filename_changed.connect(self._on_bridge_filename)
+
+    @Slot(bool)
+    def _on_bridge_connection(self, connected: bool):
+        if connected:
+            self._bridge_label.setText("LyX: Connected")
+            self._bridge_label.setStyleSheet("color: #4caf50; padding: 2px 8px;")
+        else:
+            self._bridge_label.setText("LyX: Disconnected")
+            self._bridge_label.setStyleSheet("color: #f44336; padding: 2px 8px;")
+
+    @Slot(str)
+    def _on_bridge_filename(self, filename: str):
+        """LyX switched to a different file — auto-load it."""
+        path = Path(filename)
+        if path.exists() and path.suffix == ".lyx":
+            current = self._doc_manager.get_path()
+            if current is None or current.resolve() != path.resolve():
+                self.load_file(path)
 
     # --- Project / file actions ---
 
@@ -281,9 +522,10 @@ class MainWindow(QMainWindow):
         self._chat_input.clear()
         self._append_line(f"> {text}")
         self._append_line("")
+        self._has_received_text = False
         self._engine.send_message(text)
         self._send_btn.setEnabled(False)
-        self._status.showMessage("Claude is thinking...")
+        self._status.showMessage("Thinking...")
         self._flush_timer.start()
 
     # --- Streaming handlers ---
@@ -295,8 +537,18 @@ class MainWindow(QMainWindow):
     @Slot()
     def _flush_pending(self):
         """Flush accumulated text to the display in one batch."""
+        # Update status bar with elapsed time
+        busy = self._engine.is_busy()
+        if busy:
+            elapsed = self._engine.elapsed()
+            if self._has_received_text:
+                self._status.showMessage(f"Responding... {elapsed:.0f}s")
+            else:
+                self._status.showMessage(f"Thinking... {elapsed:.0f}s")
+
         if not self._pending_text:
             return
+        self._has_received_text = True
         text = self._pending_text
         self._pending_text = ""
         cursor = self._chat_display.textCursor()
@@ -310,9 +562,24 @@ class MainWindow(QMainWindow):
     def _on_response_done(self, full_text: str):
         self._flush_pending()
         self._flush_timer.stop()
-        self._append_line("\n")
+
+        # Build completion summary
+        duration = self._engine.last_duration()
+        usage = self._engine.last_usage()
+        parts = [f"{duration:.0f}s"]
+        if usage:
+            out_tok = usage.get("output_tokens")
+            if out_tok:
+                parts.append(f"{out_tok:,} tok")
+        summary = " | ".join(parts)
+
+        # Visible separator after the streamed response, with timing info.
+        # _append_line scrolls to bottom (appendPlainText alone does not).
+        self._append_line("")
+        self._append_line(f"--- [{summary}] ---")
+        self._append_line("")
         self._send_btn.setEnabled(True)
-        self._status.showMessage("Ready")
+        self._status.showMessage(f"Ready  —  {summary}")
 
     @Slot(str)
     def _on_error(self, error_msg: str):
@@ -328,6 +595,59 @@ class MainWindow(QMainWindow):
         name = Path(filepath).name
         self._doc_label.setText(f"{name}  ({len(content):,} chars)")
         self._status.showMessage(f"Document updated: {name}")
+
+    # --- Edit proposal handlers ---
+
+    @Slot(list)
+    def _on_edits_proposed(self, proposals: list):
+        """Show proposals in the edit panel and wire up accept/reject."""
+        self._edit_panel.show_proposals(proposals)
+
+        # Connect each card's accepted signal to apply the edit
+        for card in self._edit_panel._cards:
+            card.accepted.connect(self._apply_proposal)
+            card.rejected.connect(self._reject_proposal)
+
+        n = len(proposals)
+        duration = self._engine.last_duration()
+        self._status.showMessage(
+            f"{n} edit{'s' if n != 1 else ''} proposed  —  {duration:.0f}s  —  review below"
+        )
+
+    def _apply_proposal(self, proposal):
+        """Apply an accepted edit to disk."""
+        project_root = self._doc_manager.get_project_root()
+        if not project_root:
+            self._append_line("[Error: no project root set — cannot apply edit]")
+            return
+
+        ok = apply_edit(project_root, proposal.file_path, proposal.old_text, proposal.new_text)
+        if ok:
+            self._append_line(f"[Applied edit to {proposal.file_path}]")
+            # Tell LyX to reload from disk
+            if self._bridge and self._bridge.is_connected():
+                self._bridge.reload_buffer()
+            # Refresh context if this is the currently loaded file
+            current = self._doc_manager.get_path()
+            edited = (project_root / proposal.file_path).resolve()
+            if current and current.resolve() == edited:
+                self._refresh_context()
+        else:
+            self._append_line(f"[Failed to apply edit to {proposal.file_path} — old text not found or not unique]")
+
+    def _reject_proposal(self, proposal):
+        """Log a rejected edit."""
+        self._append_line(f"[Rejected edit to {proposal.file_path}]")
+
+    @Slot(str)
+    def _on_parse_debug(self, msg: str):
+        self._append_line(f"[{msg}]")
+
+    @Slot()
+    def _on_edits_resolved(self):
+        """Hide the edit panel after all proposals are resolved."""
+        # Small delay so the user can see the final state
+        QTimer.singleShot(1500, self._edit_panel.hide)
 
     # --- Text output ---
 

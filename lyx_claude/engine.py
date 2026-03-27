@@ -2,8 +2,12 @@
 
 import json
 import shutil
+import sys
+import time
 
 from PySide6.QtCore import QObject, QProcess, Signal
+
+from .edits import EditProposal, parse_proposals
 
 
 SYSTEM_PROMPT = """\
@@ -24,14 +28,49 @@ The document is in LyX format (.lyx), a plain-text markup. Key conventions:
 - `\\begin_layout Chapter*` for unnumbered chapters
 - Blank lines separate paragraphs within a layout block
 
-## Editing Rules
+IMPORTANT — line wrapping in .lyx files:
+LyX hard-wraps long lines at arbitrary positions in its source format.  These
+line breaks are MEANINGLESS — LyX joins them back when rendering and exporting
+to LaTeX.  For example, the source might say:
+    "the missing element of an achieved form of historica
+    l life—in Hegel's sense"
+but this renders correctly as "historical life—in Hegel's sense".
+Do NOT treat mid-word line breaks in .lyx source as typos or errors.
+When proposing edits, you MUST match the exact line breaks as they appear in
+the source, even if words are split across lines.
 
-When proposing edits to the document:
-1. Show the exact old text and new text for search-and-replace
-2. The old_text must be unique in the document
-3. Include enough surrounding context for uniqueness
-4. Work with the raw LyX markup, not rendered text
-5. Preserve all LyX inset structure (don't break \\begin_inset/\\end_inset pairs)
+## How to Edit the Document
+
+Your Edit and Write tools are disabled.  The ONLY way to modify files is by
+outputting proposed-edit blocks in your response text.  The sidecar app parses
+these blocks and shows the user an Accept/Reject panel automatically.
+
+CRITICAL RULES — you MUST follow all of these:
+- ALWAYS output the blocks directly when you want to suggest changes.
+  NEVER ask "shall I provide the edit blocks?" or "would you like me to show
+  the changes?" — just OUTPUT them immediately.
+- NEVER mention the proposed-edit format to the user or explain how it works.
+- NEVER wrap the blocks in markdown code fences (no ```).
+- NEVER refer to the blocks as "XML" or discuss their syntax.
+- Briefly describe what you are changing in plain language, then output the blocks.
+
+Format (one block per edit, raw in your response text, not in code fences):
+
+<proposed-edit file="relative/path/to/file.lyx">
+<old>
+exact old text to find (multi-line OK)
+</old>
+<new>
+exact replacement text (multi-line OK)
+</new>
+</proposed-edit>
+
+The `file` attribute is a path relative to the project root.
+The old text must appear EXACTLY ONCE in the file — include enough surrounding
+context (neighboring lines) to guarantee uniqueness.
+Work with the raw LyX markup, not rendered text.
+Preserve all LyX inset structure (never break \\begin_inset/\\end_inset pairs).
+You may output multiple blocks in one response.
 
 ## Current Document
 
@@ -46,6 +85,8 @@ class ConversationEngine(QObject):
     streaming_chunk = Signal(str)
     response_finished = Signal(str)
     response_error = Signal(str)
+    edits_proposed = Signal(list)   # list[EditProposal]
+    parse_debug = Signal(str)       # diagnostic info about proposal parsing
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,6 +98,8 @@ class ConversationEngine(QObject):
         self._full_text: str = ""
         self._stderr_buf: str = ""
         self._claude_bin = shutil.which("claude") or "claude"
+        self._start_time: float = 0.0
+        self._usage: dict | None = None  # token usage from result message
 
     def set_model(self, model_id: str):
         self._model = model_id
@@ -81,6 +124,8 @@ class ConversationEngine(QObject):
         self._buffer = ""
         self._full_text = ""
         self._stderr_buf = ""
+        self._start_time = time.monotonic()
+        self._usage = None
 
         args = [
             "--print",
@@ -90,6 +135,7 @@ class ConversationEngine(QObject):
             "--model", self._model,
             "--system-prompt", self._build_system(),
             "--dangerously-skip-permissions",
+            "--allowedTools", "Read,Glob,Grep",
         ]
 
         # Resume session for multi-turn conversation
@@ -151,8 +197,10 @@ class ConversationEngine(QObject):
                 self._session_id = sid
 
         elif msg_type == "result":
-            # Final result object — we handle completion in _on_finished
-            pass
+            # Capture token usage if present
+            usage = msg.get("usage") or msg.get("result", {}).get("usage")
+            if usage:
+                self._usage = usage
 
     def _on_stderr(self):
         data = self._process.readAllStandardError().data().decode("utf-8", errors="replace")
@@ -175,6 +223,15 @@ class ConversationEngine(QObject):
 
         if exit_code == 0 and self._full_text:
             self.response_finished.emit(self._full_text)
+            # Check for edit proposals in the response
+            proposals = parse_proposals(self._full_text)
+            if proposals:
+                self.edits_proposed.emit(proposals)
+            elif "<proposed-edit" in self._full_text:
+                # Tags present but regex didn't match — emit debug info
+                self.parse_debug.emit(
+                    "Warning: <proposed-edit> tags found but could not be parsed"
+                )
         elif exit_code != 0:
             err = self._stderr_buf.strip() if self._stderr_buf.strip() else f"claude exited with code {exit_code}"
             self.response_error.emit(err)
@@ -196,3 +253,19 @@ class ConversationEngine(QObject):
 
     def is_busy(self) -> bool:
         return self._process is not None and self._process.state() != QProcess.NotRunning
+
+    def elapsed(self) -> float:
+        """Seconds since the current request started."""
+        if self._start_time and self.is_busy():
+            return time.monotonic() - self._start_time
+        return 0.0
+
+    def last_duration(self) -> float:
+        """Seconds the last completed request took."""
+        if self._start_time:
+            return time.monotonic() - self._start_time
+        return 0.0
+
+    def last_usage(self) -> dict | None:
+        """Token usage dict from the last completed response, or None."""
+        return self._usage
