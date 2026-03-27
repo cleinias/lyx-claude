@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from .lyxbridge import LyXBridge
+from .lyxbridge import LyXBridge, find_lyxpipe
 from .ui import MainWindow
 
 
@@ -19,8 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="LyX-Claude sidecar")
     parser.add_argument("path", nargs="?", help="Project directory or .lyx file")
     parser.add_argument(
-        "--pipe", default="~/.lyx/lyxpipe",
-        help="Path to LyX server pipe (default: ~/.lyx/lyxpipe)",
+        "--pipe", default=None,
+        help="Path to LyX server pipe (auto-detected if not specified)",
     )
     parser.add_argument(
         "--no-pipe", action="store_true",
@@ -32,7 +32,8 @@ def main():
 
     # Set up LyX pipe bridge (unless disabled)
     if not args.no_pipe:
-        bridge = LyXBridge(args.pipe, parent=window)
+        pipe_path = args.pipe or find_lyxpipe()
+        bridge = LyXBridge(pipe_path, parent=window)
         window.set_bridge(bridge)
         bridge.start()
 

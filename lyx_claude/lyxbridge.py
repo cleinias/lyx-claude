@@ -21,9 +21,58 @@ bridge detects the broken pipe and reconnects automatically.
 import os
 import select
 import stat
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
+
+
+def find_lyxpipe() -> str:
+    """Auto-detect the LyX server pipe path across platforms and versions.
+
+    Probes candidate locations for an active pipe (FIFO exists), preferring
+    the newest LyX version found.  If no active pipe is found, returns the
+    best-guess default so the reconnect timer can keep trying.
+
+    Linux candidates:   ~/.lyx/lyxpipe, ~/.lyx-<version>/lyxpipe
+    macOS candidates:   ~/Library/Application Support/LyX-<version>/lyxpipe
+    """
+    home = Path.home()
+    candidates: list[Path] = []
+
+    if sys.platform == "darwin":
+        app_support = home / "Library" / "Application Support"
+        if app_support.is_dir():
+            # Versioned dirs, newest first
+            lyx_dirs = sorted(app_support.glob("LyX-*"), reverse=True)
+            for d in lyx_dirs:
+                if d.is_dir():
+                    candidates.append(d / "lyxpipe")
+            # Unversioned fallback
+            candidates.append(app_support / "LyX" / "lyxpipe")
+    else:
+        # Linux / other Unix
+        # Versioned dirs, newest first
+        lyx_dirs = sorted(home.glob(".lyx-*"), reverse=True)
+        for d in lyx_dirs:
+            if d.is_dir():
+                candidates.append(d / "lyxpipe")
+        # Default unversioned
+        candidates.append(home / ".lyx" / "lyxpipe")
+
+    # Probe for an active FIFO
+    for pipe_path in candidates:
+        in_path = str(pipe_path) + ".in"
+        try:
+            if stat.S_ISFIFO(os.stat(in_path).st_mode):
+                return str(pipe_path)
+        except OSError:
+            continue
+
+    # No active pipe — return platform default for reconnect attempts
+    if candidates:
+        return str(candidates[0])
+    return str(home / ".lyx" / "lyxpipe")
 
 
 class LyXBridge(QObject):
