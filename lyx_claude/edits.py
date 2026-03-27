@@ -61,23 +61,76 @@ def parse_proposals(text: str) -> list[EditProposal]:
     return proposals
 
 
-def apply_edit(project_root: Path, file_path: str, old_text: str, new_text: str) -> bool:
+def _build_flex_pattern(old_text: str) -> str:
+    """Build a regex pattern from old_text that handles LyX line wrapping.
+
+    LyX hard-wraps lines at ~80 columns, inserting newlines at arbitrary
+    positions — even mid-word (e.g. "historica\\nl" for "historical").
+    This builds a pattern where ``\\s*`` is allowed between any adjacent
+    non-whitespace characters within a paragraph, while paragraph breaks
+    (``\\n\\n``) are preserved as mandatory boundaries.
+    """
+    # Split on paragraph breaks (2+ newlines, possibly with spaces/tabs between)
+    paragraphs = re.split(r"\n[ \t]*\n", old_text)
+
+    para_patterns = []
+    for para in paragraphs:
+        chars = [ch for ch in para if not ch.isspace()]
+        if not chars:
+            continue
+        # Each char escaped, with \s* between them to absorb arbitrary wrapping
+        para_patterns.append(r"\s*".join(re.escape(ch) for ch in chars))
+
+    # Paragraph breaks: require at least two newlines
+    return r"\s*\n\s*\n\s*".join(para_patterns)
+
+
+def apply_edit(
+    project_root: Path, file_path: str, old_text: str, new_text: str
+) -> str | None:
     """Apply a single search-and-replace edit to a file on disk.
 
-    Returns True on success, False if old_text was not found or file missing.
+    Returns None on success, or an error message string on failure.
+    Falls back to whitespace-flexible matching when exact match fails,
+    to handle LyX's arbitrary line wrapping.
     """
     full_path = project_root / file_path
     if not full_path.exists():
-        return False
+        return f"file not found: {file_path}"
 
     content = full_path.read_text(encoding="utf-8")
-    if old_text not in content:
-        return False
 
-    # Ensure the match is unique
-    if content.count(old_text) != 1:
-        return False
+    # Fast path: exact match
+    if old_text in content:
+        if content.count(old_text) != 1:
+            return f"old text matches {content.count(old_text)} times (must be unique)"
+        new_content = content.replace(old_text, new_text, 1)
+        full_path.write_text(new_content, encoding="utf-8")
+        return None
 
-    new_content = content.replace(old_text, new_text, 1)
+    # Fallback: flexible whitespace matching (handles LyX line wrapping)
+    # Skip for very large old_text to avoid regex performance issues
+    if len(old_text) > 10_000:
+        return "old text not found (exact match failed; too large for flexible match)"
+
+    pattern = _build_flex_pattern(old_text)
+    try:
+        matches = list(re.finditer(pattern, content))
+    except re.error as e:
+        return f"regex error in flexible match: {e}"
+
+    if len(matches) == 0:
+        return "old text not found (even with flexible whitespace matching)"
+    if len(matches) > 1:
+        return f"flexible match found {len(matches)} locations (must be unique — add more context)"
+
+    # Replace the matched span with new_text
+    m = matches[0]
+    new_content = content[: m.start()] + new_text + content[m.end() :]
     full_path.write_text(new_content, encoding="utf-8")
-    return True
+    print(
+        f"[edits.py] Flexible match applied to {file_path} "
+        f"(span {m.start()}:{m.end()}, {m.end()-m.start()} chars replaced)",
+        file=sys.stderr,
+    )
+    return None

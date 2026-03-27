@@ -621,8 +621,8 @@ class MainWindow(QMainWindow):
             self._append_line("[Error: no project root set — cannot apply edit]")
             return
 
-        ok = apply_edit(project_root, proposal.file_path, proposal.old_text, proposal.new_text)
-        if ok:
+        error = apply_edit(project_root, proposal.file_path, proposal.old_text, proposal.new_text)
+        if error is None:
             self._append_line(f"[Applied edit to {proposal.file_path}]")
             # Tell LyX to reload from disk
             if self._bridge and self._bridge.is_connected():
@@ -633,7 +633,7 @@ class MainWindow(QMainWindow):
             if current and current.resolve() == edited:
                 self._refresh_context()
         else:
-            self._append_line(f"[Failed to apply edit to {proposal.file_path} — old text not found or not unique]")
+            self._append_line(f"[Failed to apply edit to {proposal.file_path} — {error}]")
 
     def _reject_proposal(self, proposal):
         """Log a rejected edit."""
