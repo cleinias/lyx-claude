@@ -74,6 +74,16 @@ You may output multiple blocks in one response.
 
 ## Current Document
 
+## Dual Context
+
+You receive the document in two forms:
+1. **Raw LyX markup** — use this for proposing edits (search-and-replace must match raw markup exactly)
+2. **Plain text (rendered)** — use this for reading and understanding the prose naturally
+
+The plain text is exported by LyX and reflects the rendered output without markup.
+When it is available, prefer reading the plain text for comprehension, but always
+edit the raw LyX markup.
+
 The current document content is provided below. When it changes (user saves in LyX),
 you'll receive an updated version.
 """
@@ -91,6 +101,8 @@ class ConversationEngine(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._document_content: str = ""
+        self._plaintext_content: str = ""
+        self._current_layout: str = ""
         self._model = "sonnet"
         self._process: QProcess | None = None
         self._session_id: str | None = None
@@ -107,13 +119,24 @@ class ConversationEngine(QObject):
     def set_document_content(self, content: str):
         self._document_content = content
 
+    def set_plaintext_content(self, content: str):
+        self._plaintext_content = content
+
+    def set_current_layout(self, layout: str):
+        self._current_layout = layout
+
     def _build_system(self) -> str:
         system = SYSTEM_PROMPT
         if self._document_content:
             doc = self._document_content
             if len(doc) > 300_000:
                 doc = doc[:300_000] + "\n\n[... document truncated ...]"
-            system += f"\n\n---\n\n{doc}"
+            system += f"\n\n---\n\n## Raw LyX markup\n\n{doc}"
+        if self._plaintext_content:
+            plain = self._plaintext_content
+            if len(plain) > 100_000:
+                plain = plain[:100_000] + "\n\n[... plain text truncated ...]"
+            system += f"\n\n---\n\n## Plain text (rendered)\n\n{plain}"
         return system
 
     def send_message(self, user_text: str):
@@ -143,6 +166,9 @@ class ConversationEngine(QObject):
             args.extend(["--resume", self._session_id])
 
         args.append("--")  # separate options from positional prompt
+        # Prepend layout context if available
+        if self._current_layout:
+            user_text = f"[Cursor is at layout: {self._current_layout}]\n\n{user_text}"
         args.append(user_text)
 
         self._process = QProcess(self)

@@ -61,6 +61,40 @@ def parse_proposals(text: str) -> list[EditProposal]:
     return proposals
 
 
+# Matches common LyX markup commands — if either old or new text contains
+# these, the edit is NOT plain text and must go through the file-write path.
+_LYX_MARKUP_RE = re.compile(
+    r"\\(?:begin_inset|end_inset|begin_layout|end_layout|emph |lang |"
+    r"begin_deeper|end_deeper|backslash|labelwidthstring|paragraph_spacing|"
+    r"align |family |series |shape |size |bar |strikeout |"
+    r"begin_body|end_body|begin_header|end_header)"
+)
+
+
+def is_plain_text_edit(old_text: str, new_text: str) -> bool:
+    """Return True if neither old nor new text contains LyX markup.
+
+    Plain-text edits can be applied via LyX's word-replace LFUN, which
+    preserves the undo stack.
+    """
+    return not _LYX_MARKUP_RE.search(old_text) and not _LYX_MARKUP_RE.search(new_text)
+
+
+def collapse_lyx_wrapping(text: str) -> str:
+    """Collapse LyX's hard line wrapping into flowing text.
+
+    Single newlines are joined into spaces (LyX wrapping artifacts).
+    Double newlines (paragraph breaks) are preserved.
+    """
+    # Split on paragraph breaks (two or more newlines)
+    paragraphs = re.split(r"\n[ \t]*\n", text)
+    collapsed = []
+    for para in paragraphs:
+        # Join single newlines within a paragraph
+        collapsed.append(" ".join(para.split()))
+    return "\n\n".join(collapsed)
+
+
 def _build_flex_pattern(old_text: str) -> str:
     """Build a regex pattern from old_text that handles LyX line wrapping.
 

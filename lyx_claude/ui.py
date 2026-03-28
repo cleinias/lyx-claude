@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .document import DocumentManager
-from .edits import EditProposal, apply_edit
+from .edits import EditProposal, apply_edit, is_plain_text_edit, collapse_lyx_wrapping
 from .engine import ConversationEngine
 
 
@@ -288,6 +288,7 @@ class MainWindow(QMainWindow):
         self._doc_manager = DocumentManager(self)
         self._engine = ConversationEngine(self)
         self._bridge = None  # set via set_bridge() if pipe integration is enabled
+        self._current_layout = ""
 
         # Streaming text buffer — flushed on timer
         self._pending_text = ""
@@ -379,6 +380,13 @@ class MainWindow(QMainWindow):
         self._chat_input = ChatInput(self._send_message)
         input_layout.addWidget(self._chat_input, stretch=1)
 
+        self._sel_btn = QPushButton("Selection")
+        self._sel_btn.setFixedWidth(75)
+        self._sel_btn.setToolTip("Grab selection from LyX (Ctrl+Shift+S)")
+        self._sel_btn.clicked.connect(self._grab_selection)
+        self._sel_btn.setEnabled(False)  # enabled when bridge connects
+        input_layout.addWidget(self._sel_btn, alignment=Qt.AlignBottom)
+
         send_btn = QPushButton("Send")
         send_btn.setFixedWidth(60)
         send_btn.clicked.connect(self._send_message)
@@ -387,9 +395,16 @@ class MainWindow(QMainWindow):
 
         chat_layout.addLayout(input_layout)
 
+        # Ctrl+Shift+S shortcut for selection
+        sel_action = QAction("Grab Selection", self)
+        sel_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        sel_action.triggered.connect(self._grab_selection)
+        self.addAction(sel_action)
+
         # Command bar — keyboard shortcut hints
         cmd_bar = QLabel(
             "Enter Send  |  Shift+Enter Newline  |  "
+            "Ctrl+Shift+S Selection  |  "
             "Ctrl+R Refresh  |  Ctrl+O Open file  |  "
             "Ctrl+Shift+O Open project"
         )
@@ -431,6 +446,7 @@ class MainWindow(QMainWindow):
         self._bridge_label.setStyleSheet("color: #f44336; padding: 2px 8px;")
         bridge.connection_changed.connect(self._on_bridge_connection)
         bridge.filename_changed.connect(self._on_bridge_filename)
+        bridge.layout_changed.connect(self._on_bridge_layout)
 
     @Slot(bool)
     def _on_bridge_connection(self, connected: bool):
@@ -440,6 +456,7 @@ class MainWindow(QMainWindow):
         else:
             self._bridge_label.setText("LyX: Disconnected")
             self._bridge_label.setStyleSheet("color: #f44336; padding: 2px 8px;")
+        self._sel_btn.setEnabled(connected)
 
     @Slot(str)
     def _on_bridge_filename(self, filename: str):
@@ -449,6 +466,85 @@ class MainWindow(QMainWindow):
             current = self._doc_manager.get_path()
             if current is None or current.resolve() != path.resolve():
                 self.load_file(path)
+
+    @Slot(str)
+    def _on_bridge_layout(self, layout: str):
+        """LyX cursor moved to a different layout type."""
+        self._current_layout = layout
+        self._engine.set_current_layout(layout)
+        self._update_doc_label()
+
+    def _update_doc_label(self):
+        """Refresh the document info label with filename, size, and layout."""
+        current = self._doc_manager.get_path()
+        if current is None:
+            self._doc_label.setText("No document loaded  —  open a project folder or .lyx file")
+            return
+        name = current.name
+        content = self._doc_manager.get_content() or ""
+        parts = [f"{name}  ({len(content):,} chars)"]
+        if self._current_layout:
+            parts.append(f"Layout: {self._current_layout}")
+        self._doc_label.setText("  |  ".join(parts))
+
+    # --- Selection bridge ---
+
+    @Slot()
+    def _grab_selection(self):
+        """Grab the current selection from LyX and insert as quoted text."""
+        if not self._bridge or not self._bridge.is_connected():
+            self._status.showMessage("LyX not connected")
+            return
+
+        clipboard = QApplication.clipboard()
+        old_clip = clipboard.text()
+        self._bridge.copy_selection()
+        # Delay to let clipboard propagate
+        QTimer.singleShot(150, lambda: self._read_selection_clipboard(old_clip))
+
+    def _read_selection_clipboard(self, old_clip: str):
+        """Read clipboard after copy LFUN, insert as quoted block if changed."""
+        clipboard = QApplication.clipboard()
+        new_clip = clipboard.text()
+        if new_clip == old_clip or not new_clip.strip():
+            self._status.showMessage("No selection in LyX")
+            return
+
+        # Insert as quoted block
+        lines = new_clip.strip().split("\n")
+        quoted = "\n".join(f"> {line}" for line in lines)
+
+        cursor = self._chat_input.textCursor()
+        if self._chat_input.toPlainText():
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText("\n")
+        cursor.insertText(quoted + "\n")
+        self._chat_input.setTextCursor(cursor)
+        self._chat_input.setFocus()
+        self._status.showMessage(f"Selection inserted ({len(new_clip)} chars)")
+
+    # --- Plain text export ---
+
+    def _export_plaintext(self):
+        """Export current buffer as plain text via LyX and load result."""
+        if not self._bridge or not self._bridge.is_connected():
+            return
+        txt_path = self._bridge.export_plaintext()
+        if txt_path:
+            QTimer.singleShot(500, lambda: self._read_plaintext(txt_path))
+
+    def _read_plaintext(self, path: Path):
+        """Read the exported plain text file and pass to engine."""
+        if not path.exists():
+            return
+        try:
+            content = path.read_text(encoding="utf-8")
+            self._engine.set_plaintext_content(content)
+            self._status.showMessage(
+                f"Plain text loaded ({len(content):,} chars)"
+            )
+        except Exception:
+            pass  # silently skip if read fails
 
     # --- Project / file actions ---
 
@@ -465,11 +561,11 @@ class MainWindow(QMainWindow):
         try:
             content = self._doc_manager.open_file(path)
             self._engine.set_document_content(content)
-            name = path.name
-            self._doc_label.setText(f"{name}  ({len(content):,} chars)")
+            self._update_doc_label()
             self._status.showMessage(f"Loaded: {path}")
-            self._append_line(f"--- Document loaded: {name} ---")
+            self._append_line(f"--- Document loaded: {path.name} ---")
             self._file_tree.highlight_file(str(path))
+            self._export_plaintext()
         except Exception as e:
             self._status.showMessage(f"Error: {e}")
 
@@ -502,8 +598,10 @@ class MainWindow(QMainWindow):
         content = self._doc_manager.refresh()
         if content:
             self._engine.set_document_content(content)
+            self._update_doc_label()
             self._status.showMessage("Context refreshed")
             self._append_line("--- Context refreshed ---")
+            self._export_plaintext()
         else:
             self._status.showMessage("No document to refresh")
 
@@ -523,6 +621,8 @@ class MainWindow(QMainWindow):
         self._append_line(f"> {text}")
         self._append_line("")
         self._has_received_text = False
+        # Ensure engine has latest layout before sending
+        self._engine.set_current_layout(self._current_layout)
         self._engine.send_message(text)
         self._send_btn.setEnabled(False)
         self._status.showMessage("Thinking...")
@@ -592,9 +692,9 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _on_doc_changed(self, filepath: str, content: str):
         self._engine.set_document_content(content)
-        name = Path(filepath).name
-        self._doc_label.setText(f"{name}  ({len(content):,} chars)")
-        self._status.showMessage(f"Document updated: {name}")
+        self._update_doc_label()
+        self._status.showMessage(f"Document updated: {Path(filepath).name}")
+        self._export_plaintext()
 
     # --- Edit proposal handlers ---
 
@@ -615,11 +715,26 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_proposal(self, proposal):
-        """Apply an accepted edit to disk."""
+        """Apply an accepted edit to disk (or via LyX word-replace for plain text)."""
         project_root = self._doc_manager.get_project_root()
         if not project_root:
             self._append_line("[Error: no project root set — cannot apply edit]")
             return
+
+        # Try word-replace via LyX for plain-text edits (preserves undo stack)
+        if (self._bridge and self._bridge.is_connected()
+                and is_plain_text_edit(proposal.old_text, proposal.new_text)):
+            search = collapse_lyx_wrapping(proposal.old_text)
+            replace = collapse_lyx_wrapping(proposal.new_text)
+            if self._bridge.word_replace(search, replace):
+                self._append_line(f"[Applied edit to {proposal.file_path} via LyX word-replace]")
+                self._bridge.activate()
+                # Refresh context after word-replace
+                current = self._doc_manager.get_path()
+                edited = (project_root / proposal.file_path).resolve()
+                if current and current.resolve() == edited:
+                    QTimer.singleShot(300, self._refresh_context)
+                return
 
         error = apply_edit(project_root, proposal.file_path, proposal.old_text, proposal.new_text)
         if error is None:
@@ -627,6 +742,7 @@ class MainWindow(QMainWindow):
             # Tell LyX to reload from disk
             if self._bridge and self._bridge.is_connected():
                 self._bridge.reload_buffer()
+                self._bridge.activate()
             # Refresh context if this is the currently loaded file
             current = self._doc_manager.get_path()
             edited = (project_root / proposal.file_path).resolve()

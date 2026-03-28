@@ -80,6 +80,7 @@ class LyXBridge(QObject):
 
     connection_changed = Signal(bool)   # True = connected, False = disconnected
     filename_changed = Signal(str)      # emitted when LyX's active file changes
+    layout_changed = Signal(str)        # emitted when cursor's layout changes
 
     CLIENT_NAME = "lyxclaude"
     POLL_INTERVAL_MS = 3000
@@ -93,6 +94,7 @@ class LyXBridge(QObject):
         self._out_fd: int | None = None
         self._connected = False
         self._current_filename = ""
+        self._current_layout = ""
 
         # Periodic poll: check LyX's active filename
         self._poll_timer = QTimer(self)
@@ -145,6 +147,44 @@ class LyXBridge(QObject):
         if resp is None:
             return None
         return self._parse_info(resp)
+
+    def get_layout(self) -> str | None:
+        """Return the layout name at the cursor position, or None."""
+        resp = self.send_command("server-get-layout")
+        if resp is None:
+            return None
+        return self._parse_info(resp)
+
+    def activate(self):
+        """Bring LyX window to front."""
+        self.send_command("lyx-activate")
+
+    def copy_selection(self):
+        """Tell LyX to copy the current selection to the clipboard."""
+        self.send_command("copy")
+
+    def export_plaintext(self) -> Path | None:
+        """Export the current buffer as plain text.
+
+        Returns the expected .txt path (same dir as .lyx, with .txt extension),
+        or None if the bridge is not connected.
+        """
+        name = self.get_filename()
+        if name is None:
+            return None
+        self.send_command("buffer-export", "text")
+        return Path(name).with_suffix(".txt")
+
+    def word_replace(self, search: str, replace: str) -> bool:
+        """Replace text using LyX's word-replace LFUN.
+
+        Uses literal ``\\n`` as field separator per LyX protocol.
+        Returns True if the command was sent successfully.
+        """
+        # word-replace format: "search\nreplace\n" with literal backslash-n
+        arg = f"{search}\\n{replace}\\n"
+        resp = self.send_command("word-replace", arg)
+        return resp is not None
 
     def reload_buffer(self) -> bool:
         """Tell LyX to reload the current buffer from disk."""
@@ -260,8 +300,13 @@ class LyXBridge(QObject):
         self._out_fd = None
 
     def _poll(self):
-        """Periodic check: detect if LyX switched to a different file."""
+        """Periodic check: detect if LyX switched to a different file or layout."""
         name = self.get_filename()
         if name is not None and name != self._current_filename:
             self._current_filename = name
             self.filename_changed.emit(name)
+
+        layout = self.get_layout()
+        if layout is not None and layout != self._current_layout:
+            self._current_layout = layout
+            self.layout_changed.emit(layout)
