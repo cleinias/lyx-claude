@@ -48,7 +48,35 @@ lyx-claude hardcodes `--model sonnet`.
 - Wire it to `ConversationEngine.set_model()`
 - Already supported by the engine — just needs UI
 
-#### 2. Slash commands
+#### 2. LyX toolbar/menu integration
+Like the Claude icon in PyCharm's toolbar, add a button in LyX that launches
+lyx-claude. This makes it a one-click launch instead of requiring a separate
+terminal.
+
+**Implementation sketch:**
+- Add a single-instance check to `main.py` (lock file or `pgrep`): if
+  lyx-claude is already running, bring the window to front and exit
+- Create a wrapper script `~/.local/bin/launch-lyx-claude`:
+  ```sh
+  #!/bin/sh
+  pgrep -f "lyx-claude" > /dev/null && exit 0
+  lyx-claude "$1" &
+  ```
+- Use LyX's `buffer-export-custom` LFUN to launch it, passing the current
+  file: `buffer-export-custom lyx "launch-lyx-claude $$FName"`
+- Wire this to a LyX toolbar button and/or Tools menu item via a custom
+  `~/.lyx/ui/default.ui` that includes the standard menus plus:
+  ```
+  Toolbar "claude" "Claude AI"
+      Item "Claude Assistant" "buffer-export-custom lyx \"launch-lyx-claude $$FName\""
+  End
+  ```
+- Optionally add a keybinding in `~/.lyx/bind/user.bind`
+
+**Note:** LyX has no generic "run shell command" LFUN, so `buffer-export-custom`
+is the standard workaround for launching external tools.
+
+#### 3. Slash commands
 IDE provides `/clear`, `/compact`, `/model`, `/export`, etc.
 lyx-claude has toolbar buttons and keyboard shortcuts but no text commands.
 
@@ -65,7 +93,7 @@ lyx-claude has toolbar buttons and keyboard shortcuts but no text commands.
 
 ### Priority 2 — High impact, moderate effort
 
-#### 3. Conversation history and resume UI
+#### 4. Conversation history and resume UI
 IDE stores past conversations, searchable by keyword/time. lyx-claude has
 `--resume` but no UI to browse or revisit past sessions.
 
@@ -76,7 +104,7 @@ IDE stores past conversations, searchable by keyword/time. lyx-claude has
 - Double-click to resume a session via `--resume <session_id>`
 - Optional: search/filter by text
 
-#### 4. Checkpoints / rewind
+#### 5. Checkpoints / rewind
 Every prompt creates a snapshot of the file. User can rewind to any prior
 state. Critical safety net for a writing tool where an accepted edit might
 turn out wrong.
@@ -88,7 +116,7 @@ turn out wrong.
 - Restoring a checkpoint: copy it back, send `buffer-reload dump`
 - Simple and robust — no need for git integration
 
-#### 5. Context compaction (`/compact`)
+#### 6. Context compaction (`/compact`)
 When context fills up, IDE compresses it with optional focus instructions.
 lyx-claude has no way to manage context growth across a long session.
 
@@ -101,7 +129,7 @@ lyx-claude has no way to manage context growth across a long session.
 
 ### Priority 3 — Medium impact, moderate effort
 
-#### 6. @-mention file references
+#### 7. @-mention file references
 Type `@filename` in chat to attach additional files as context.
 Useful for discussing how one chapter relates to another.
 
@@ -111,7 +139,7 @@ Useful for discussing how one chapter relates to another.
 - Append its content (or a summary) to the user message
 - Autocomplete from the project file list
 
-#### 7. Plan mode
+#### 8. Plan mode
 Claude explores and produces a plan before making changes. User reviews,
 annotates, then approves. Good for structural edits like reorganizing a chapter.
 
@@ -122,7 +150,7 @@ annotates, then approves. Good for structural edits like reorganizing a chapter.
 - User can say "go ahead" to execute, or refine
 - Could also work as a two-step: plan → approve → execute
 
-#### 8. Permission modes
+#### 9. Permission modes
 Cycle between "ask before each edit" (show tracked changes, wait for
 Accept All), "auto-accept edits" (apply and accept immediately), and
 "suggest only" (show in chat but don't modify file).
@@ -136,11 +164,11 @@ Accept All), "auto-accept edits" (apply and accept immediately), and
 
 ### Priority 4 — Nice to have
 
-#### 9. Conversation export
+#### 10. Conversation export
 `/export` dumps the conversation as a text or markdown file.
 Useful for keeping research notes from a brainstorming session.
 
-#### 10. Side questions
+#### 11. Side questions
 Quick question that doesn't pollute conversation history.
 "What does this Latin phrase mean?" without derailing the editing session.
 
@@ -149,15 +177,15 @@ Quick question that doesn't pollute conversation history.
   the answer inline
 - Does not affect the main session's context
 
-#### 11. Prompt suggestions
+#### 12. Prompt suggestions
 After Claude responds, show suggested follow-up prompts as clickable chips.
 Tab to accept.
 
-#### 12. Image paste
+#### 13. Image paste
 Paste images into the prompt (Ctrl+V). Could be useful for discussing
 diagrams, figures, or page layouts.
 
-#### 13. Multi-file edits
+#### 14. Multi-file edits
 Currently each response's proposals target the active file. Supporting
 atomic edits across multiple files (e.g., updating a cross-reference in
 two chapters) would require extending `apply_all_tracked()` to handle
