@@ -159,9 +159,40 @@ class LyXBridge(QObject):
         """Bring LyX window to front."""
         self.send_command("lyx-activate")
 
-    def copy_selection(self):
-        """Tell LyX to copy the current selection to the clipboard."""
-        self.send_command("copy")
+    def export_selection(self) -> Path | None:
+        """Export the current LyX selection as plain text via a temp buffer.
+
+        On Wayland, pipe-dispatched LFUNs cannot write to the system clipboard.
+        This works around that by using LyX's internal cut stack: ``copy``
+        populates it (regardless of clipboard), then we paste into a temp
+        buffer, export as text, and close it.
+        """
+        tmp_lyx = Path("/tmp/lyx-claude-sel.lyx")
+        tmp_txt = Path("/tmp/lyx-claude-sel.txt")
+        tmp_lyx.unlink(missing_ok=True)
+        tmp_txt.unlink(missing_ok=True)
+
+        # Stop polling to prevent response desync (poll responses
+        # can pile up in the pipe and shift all subsequent reads).
+        self._poll_timer.stop()
+        self._drain_pipe()
+
+        # Single command-sequence: LyX executes each step synchronously
+        # before moving to the next, so paste sees the copy result, etc.
+        # buffer-close is separate because buffer-export is async.
+        seq = (
+            "copy ; "
+            "buffer-new ; "
+            "paste ; "
+            f"buffer-write-as {tmp_lyx} ; "
+            "buffer-export text"
+        )
+        resp = self.send_command("command-sequence", seq)
+        print(f"[selection] command-sequence → {resp!r}", file=sys.stderr)
+
+        self._poll_timer.start()
+
+        return tmp_txt
 
     def export_plaintext(self) -> Path | None:
         """Export the current buffer as plain text.
@@ -225,13 +256,18 @@ class LyXBridge(QObject):
             self._cleanup()
             return False
 
-        # Say hello
+        # Say hello and REQUIRE a response — without it, we're talking
+        # to stale FIFOs left on disk from a previous LyX session.
         if not self._raw_send(f"LYXSRV:{self.CLIENT_NAME}:hello\n"):
             self._cleanup()
             return False
 
-        # Best-effort read of the hello response
-        self._read_response(timeout=1.0)
+        hello = self._read_response(timeout=2.0)
+        if hello is None:
+            print(f"[bridge] No hello response from {self._pipe_path} — stale pipe?", file=sys.stderr)
+            self._cleanup()
+            return False
+        print(f"[bridge] Connected to LyX via {self._pipe_path} — {hello}", file=sys.stderr)
 
         self._connected = True
         self._reconnect_timer.stop()
@@ -288,6 +324,22 @@ class LyXBridge(QObject):
         self._cleanup()
         self.connection_changed.emit(False)
         self._reconnect_timer.start()
+
+    def _drain_pipe(self):
+        """Read and discard any stale responses sitting in the pipe."""
+        if self._out_fd is None:
+            return
+        while True:
+            try:
+                ready, _, _ = select.select([self._out_fd], [], [], 0.05)
+                if not ready:
+                    break
+                data = os.read(self._out_fd, 8192)
+                if not data:
+                    break
+                print(f"[bridge] drained: {data!r}", file=sys.stderr)
+            except OSError:
+                break
 
     def _cleanup(self):
         for fd in (self._in_fd, self._out_fd):

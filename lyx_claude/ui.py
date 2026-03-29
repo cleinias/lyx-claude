@@ -491,37 +491,59 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _grab_selection(self):
-        """Grab the current selection from LyX and insert as quoted text."""
+        """Grab the selected text from LyX via temp-buffer export.
+
+        Bypasses the system clipboard entirely (broken on Wayland for
+        pipe-dispatched LFUNs).  Uses LyX's internal cut stack instead:
+        copy → paste into temp buffer → export as text → read file.
+        """
         if not self._bridge or not self._bridge.is_connected():
             self._status.showMessage("LyX not connected")
             return
 
-        clipboard = QApplication.clipboard()
-        old_clip = clipboard.text()
-        self._bridge.copy_selection()
-        # Delay to let clipboard propagate
-        QTimer.singleShot(150, lambda: self._read_selection_clipboard(old_clip))
+        self._status.showMessage("Grabbing selection from LyX...")
+        txt_path = self._bridge.export_selection()
+        if txt_path:
+            # Close the temp buffer after export finishes (delay avoids
+            # "being processed" error from async buffer-export)
+            QTimer.singleShot(500, self._close_temp_buffer)
+            QTimer.singleShot(800, lambda: self._read_selection_file(txt_path))
 
-    def _read_selection_clipboard(self, old_clip: str):
-        """Read clipboard after copy LFUN, insert as quoted block if changed."""
-        clipboard = QApplication.clipboard()
-        new_clip = clipboard.text()
-        if new_clip == old_clip or not new_clip.strip():
+    def _close_temp_buffer(self):
+        """Close the temporary selection buffer in LyX."""
+        if self._bridge and self._bridge.is_connected():
+            self._bridge.send_command("buffer-close")
+
+    def _read_selection_file(self, path: Path):
+        """Read the exported selection text and insert into chat input."""
+        if not path.exists():
+            self._status.showMessage("No selection in LyX (export failed)")
+            return
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            self._status.showMessage("Failed to read selection")
+            return
+        finally:
+            # Clean up temp files
+            path.unlink(missing_ok=True)
+            path.with_suffix(".lyx").unlink(missing_ok=True)
+
+        if not text:
             self._status.showMessage("No selection in LyX")
             return
 
-        # Insert as quoted block
-        lines = new_clip.strip().split("\n")
-        quoted = "\n".join(f"> {line}" for line in lines)
+        # Insert as labelled selection block
+        block = f"[Selected text from LyX]\n{text}\n[End selection]"
 
         cursor = self._chat_input.textCursor()
         if self._chat_input.toPlainText():
             cursor.movePosition(QTextCursor.End)
             cursor.insertText("\n")
-        cursor.insertText(quoted + "\n")
+        cursor.insertText(block + "\n")
         self._chat_input.setTextCursor(cursor)
         self._chat_input.setFocus()
-        self._status.showMessage(f"Selection inserted ({len(new_clip)} chars)")
+        self._status.showMessage(f"Selection inserted ({len(text)} chars)")
 
     # --- Plain text export ---
 
@@ -560,7 +582,9 @@ class MainWindow(QMainWindow):
         path = Path(path)
         try:
             content = self._doc_manager.open_file(path)
-            self._engine.set_document_content(content)
+            root = self._doc_manager.get_project_root()
+            relpath = str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name
+            self._engine.set_document_content(content, relpath=relpath)
             self._update_doc_label()
             self._status.showMessage(f"Loaded: {path}")
             self._append_line(f"--- Document loaded: {path.name} ---")
@@ -691,7 +715,10 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_doc_changed(self, filepath: str, content: str):
-        self._engine.set_document_content(content)
+        root = self._doc_manager.get_project_root()
+        p = Path(filepath)
+        relpath = str(p.relative_to(root)) if root and p.is_relative_to(root) else p.name
+        self._engine.set_document_content(content, relpath=relpath)
         self._update_doc_label()
         self._status.showMessage(f"Document updated: {Path(filepath).name}")
         self._export_plaintext()

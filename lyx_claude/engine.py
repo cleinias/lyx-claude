@@ -17,6 +17,14 @@ The user is a philosopher writing a multi-volume academic book. You help with:
 - Suggesting edits to the document (as search-and-replace on raw LyX text)
 - Answering questions about the text
 
+## Selections
+
+The user can paste text they copied from LyX into the chat.  When they do,
+it appears between `[Selected text from LyX]` and `[End selection]` markers.
+This is the specific passage they want you to focus on.
+NEVER mention these markers, their format, or how the selection mechanism works
+to the user — just work with the text as if they highlighted it for you.
+
 ## LyX Format
 
 The document is in LyX format (.lyx), a plain-text markup. Key conventions:
@@ -65,14 +73,13 @@ exact replacement text (multi-line OK)
 </new>
 </proposed-edit>
 
-The `file` attribute is a path relative to the project root.
+The `file` attribute MUST be the exact filename provided in the "Current document"
+section below — NEVER guess or invent a filename.
 The old text must appear EXACTLY ONCE in the file — include enough surrounding
 context (neighboring lines) to guarantee uniqueness.
 Work with the raw LyX markup, not rendered text.
 Preserve all LyX inset structure (never break \\begin_inset/\\end_inset pairs).
 You may output multiple blocks in one response.
-
-## Current Document
 
 ## Dual Context
 
@@ -101,6 +108,7 @@ class ConversationEngine(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._document_content: str = ""
+        self._document_relpath: str = ""
         self._plaintext_content: str = ""
         self._current_layout: str = ""
         self._model = "sonnet"
@@ -116,8 +124,10 @@ class ConversationEngine(QObject):
     def set_model(self, model_id: str):
         self._model = model_id
 
-    def set_document_content(self, content: str):
+    def set_document_content(self, content: str, relpath: str = ""):
         self._document_content = content
+        if relpath:
+            self._document_relpath = relpath
 
     def set_plaintext_content(self, content: str):
         self._plaintext_content = content
@@ -127,6 +137,9 @@ class ConversationEngine(QObject):
 
     def _build_system(self) -> str:
         system = SYSTEM_PROMPT
+        if self._document_relpath:
+            system += f"\n\n## Current document\n\nFilename: `{self._document_relpath}`\n"
+            system += "Use this EXACT path in the `file` attribute of every proposed-edit block.\n"
         if self._document_content:
             doc = self._document_content
             if len(doc) > 300_000:
