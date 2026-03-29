@@ -2,6 +2,7 @@
 
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -168,3 +169,175 @@ def apply_edit(
         file=sys.stderr,
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Tracked-change support: apply edits as LyX tracked changes
+# ---------------------------------------------------------------------------
+
+CLAUDE_AUTHOR_NAME = "Claude Assistant"
+
+def _bernstein_hash(name: str, email: str = "") -> int:
+    """Compute LyX's Bernstein hash for an author (matches Author.cpp)."""
+    full = (name + email).encode("utf-8")
+    h = 5381
+    for c in full:
+        h = ((h << 5) + h) + c
+        h &= 0xFFFFFFFF  # keep 32-bit unsigned
+    # Convert to signed int32 (C++ int() cast)
+    if h >= 0x80000000:
+        h -= 0x100000000
+    return h
+
+CLAUDE_AUTHOR_ID = _bernstein_hash(CLAUDE_AUTHOR_NAME)
+
+# Regex to strip tracked-change markers from content (for clean context)
+_CHANGE_MARKER_RE = re.compile(
+    r"^\\change_(?:inserted|deleted)\s+-?\d+\s+\d+\s*$", re.MULTILINE
+)
+_CHANGE_UNCHANGED_RE = re.compile(r"^\\change_unchanged\s*$", re.MULTILINE)
+
+
+def strip_change_markers(content: str) -> str:
+    """Remove tracked-change markers so Claude sees clean content.
+
+    Strips \\change_inserted, \\change_deleted, and \\change_unchanged lines.
+    Does NOT remove \\author lines (those are harmless in the header).
+    """
+    content = _CHANGE_MARKER_RE.sub("", content)
+    content = _CHANGE_UNCHANGED_RE.sub("", content)
+    # Clean up double-blank-lines left by marker removal
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    return content
+
+
+def ensure_tracking_header(content: str) -> str:
+    """Enable tracked changes in the .lyx header and add Claude as author.
+
+    Modifies:
+    - \\tracking_changes false → true
+    - \\output_changes false → true
+    - Adds \\author line for Claude before \\end_header (if not present)
+    """
+    # Enable tracking
+    content = re.sub(
+        r"^(\\tracking_changes\s+)false\s*$",
+        r"\1true",
+        content, count=1, flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r"^(\\output_changes\s+)false\s*$",
+        r"\1true",
+        content, count=1, flags=re.MULTILINE,
+    )
+
+    # Add author line if not already present
+    author_line = f'\\author {CLAUDE_AUTHOR_ID} "{CLAUDE_AUTHOR_NAME}"\n'
+    if author_line.rstrip() not in content:
+        content = content.replace(
+            "\\end_header",
+            author_line + "\\end_header",
+        )
+
+    return content
+
+
+def _find_old_text(content: str, old_text: str) -> tuple[int, int] | None:
+    """Find old_text in content, returning (start, end) or None.
+
+    Tries exact match first, then flexible whitespace matching.
+    """
+    # Exact match
+    if old_text in content:
+        if content.count(old_text) != 1:
+            return None
+        idx = content.index(old_text)
+        return (idx, idx + len(old_text))
+
+    # Flexible match (handles LyX line wrapping)
+    if len(old_text) > 10_000:
+        return None
+    pattern = _build_flex_pattern(old_text)
+    try:
+        matches = list(re.finditer(pattern, content))
+    except re.error:
+        return None
+    if len(matches) != 1:
+        return None
+    return (matches[0].start(), matches[0].end())
+
+
+def _crosses_layout_boundary(content: str, start: int, end: int) -> bool:
+    """Check if the region [start, end) crosses \\begin_layout/\\end_layout."""
+    region = content[start:end]
+    return "\\begin_layout" in region or "\\end_layout" in region
+
+
+def apply_tracked_edit(
+    content: str, old_text: str, new_text: str, author_id: int,
+) -> tuple[str, str | None]:
+    """Apply a single edit as tracked changes in LyX content.
+
+    Returns (new_content, error). error is None on success.
+    """
+    ts = int(time.time())
+
+    span = _find_old_text(content, old_text)
+    if span is None:
+        # Try to give a useful error
+        if old_text in content and content.count(old_text) > 1:
+            return content, f"old text matches {content.count(old_text)} times (must be unique)"
+        return content, "old text not found"
+
+    start, end = span
+    matched_text = content[start:end]
+
+    if _crosses_layout_boundary(content, start, end):
+        return content, "edit crosses paragraph boundary (\\begin_layout/\\end_layout)"
+
+    # Build the tracked-change replacement
+    parts = []
+
+    if old_text.strip():
+        # Mark original text as deleted
+        parts.append(f"\n\\change_deleted {author_id} {ts}\n")
+        parts.append(matched_text)
+
+    if new_text.strip():
+        # Mark new text as inserted
+        parts.append(f"\n\\change_inserted {author_id} {ts}\n")
+        parts.append(new_text)
+
+    # Return to unchanged state
+    parts.append(f"\n\\change_unchanged\n")
+
+    replacement = "".join(parts)
+    new_content = content[:start] + replacement + content[end:]
+    return new_content, None
+
+
+def apply_all_tracked(
+    filepath: Path, proposals: list["EditProposal"],
+) -> tuple[int, list[str]]:
+    """Apply all proposals as tracked changes to a .lyx file.
+
+    Returns (n_applied, errors). Each error string includes the proposal index.
+    """
+    content = filepath.read_text(encoding="utf-8")
+    content = ensure_tracking_header(content)
+
+    n_applied = 0
+    errors: list[str] = []
+
+    for i, prop in enumerate(proposals):
+        content, err = apply_tracked_edit(
+            content, prop.old_text, prop.new_text, CLAUDE_AUTHOR_ID,
+        )
+        if err:
+            errors.append(f"Edit {i + 1}: {err}")
+        else:
+            n_applied += 1
+
+    # Write once at the end
+    filepath.write_text(content, encoding="utf-8")
+    return n_applied, errors

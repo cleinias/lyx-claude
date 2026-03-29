@@ -14,7 +14,10 @@ from PySide6.QtWidgets import (
 )
 
 from .document import DocumentManager
-from .edits import EditProposal, apply_edit, is_plain_text_edit, collapse_lyx_wrapping
+from .edits import (
+    EditProposal, apply_edit, apply_all_tracked, is_plain_text_edit,
+    collapse_lyx_wrapping,
+)
 from .engine import ConversationEngine
 
 
@@ -275,6 +278,61 @@ class EditPanel(QWidget):
                 card._on_reject()
 
 
+class TrackedChangeBar(QWidget):
+    """Compact bar shown after tracked changes are applied to a .lyx file."""
+
+    accept_all = Signal()
+    reject_all = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        self._label = QLabel()
+        self._label.setStyleSheet("color: #ccc;")
+        layout.addWidget(self._label, stretch=1)
+
+        self._accept_btn = QPushButton("Accept All")
+        self._accept_btn.setFixedWidth(90)
+        self._accept_btn.setStyleSheet(
+            "background-color: #2e7d32; color: white; border-radius: 3px; padding: 3px;"
+        )
+        self._accept_btn.clicked.connect(self._on_accept)
+        layout.addWidget(self._accept_btn)
+
+        self._reject_btn = QPushButton("Reject All")
+        self._reject_btn.setFixedWidth(90)
+        self._reject_btn.setStyleSheet(
+            "background-color: #c62828; color: white; border-radius: 3px; padding: 3px;"
+        )
+        self._reject_btn.clicked.connect(self._on_reject)
+        layout.addWidget(self._reject_btn)
+
+        self.hide()
+
+    def show_changes(self, n: int):
+        self._label.setText(f"<b>{n} tracked change{'s' if n != 1 else ''} applied</b>"
+                            "  —  review in LyX (Document > Changes)")
+        self._accept_btn.show()
+        self._reject_btn.show()
+        self.show()
+
+    def _on_accept(self):
+        self._accept_btn.hide()
+        self._reject_btn.hide()
+        self._label.setText("All changes accepted")
+        self.accept_all.emit()
+        QTimer.singleShot(2000, self.hide)
+
+    def _on_reject(self):
+        self._accept_btn.hide()
+        self._reject_btn.hide()
+        self._label.setText("All changes rejected")
+        self.reject_all.emit()
+        QTimer.singleShot(2000, self.hide)
+
+
 class MainWindow(QMainWindow):
     """Main chat window with project file sidebar."""
 
@@ -371,9 +429,13 @@ class MainWindow(QMainWindow):
         self._chat_display.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         chat_layout.addWidget(self._chat_display, stretch=1)
 
-        # Edit proposal panel (hidden until proposals arrive)
+        # Edit proposal panel (hidden until proposals arrive — fallback for cross-paragraph edits)
         self._edit_panel = EditPanel()
         chat_layout.addWidget(self._edit_panel)
+
+        # Tracked change bar (hidden until tracked changes are applied)
+        self._tc_bar = TrackedChangeBar()
+        chat_layout.addWidget(self._tc_bar)
 
         # Input area
         input_layout = QHBoxLayout()
@@ -436,6 +498,8 @@ class MainWindow(QMainWindow):
         self._engine.parse_debug.connect(self._on_parse_debug)
         self._doc_manager.content_changed.connect(self._on_doc_changed)
         self._edit_panel.all_resolved.connect(self._on_edits_resolved)
+        self._tc_bar.accept_all.connect(self._on_tc_accept_all)
+        self._tc_bar.reject_all.connect(self._on_tc_reject_all)
 
     # --- LyX pipe bridge ---
 
@@ -727,60 +791,98 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_edits_proposed(self, proposals: list):
-        """Show proposals in the edit panel and wire up accept/reject."""
-        self._edit_panel.show_proposals(proposals)
+        """Apply proposals as tracked changes, falling back to cards on failure."""
+        # Use the real file path from DocumentManager (ignore Claude's file attr)
+        filepath = self._doc_manager.get_path()
+        if not filepath or not filepath.exists():
+            self._append_line("[Error: no document loaded — cannot apply edits]")
+            return
 
-        # Connect each card's accepted signal to apply the edit
-        for card in self._edit_panel._cards:
-            card.accepted.connect(self._apply_proposal)
-            card.rejected.connect(self._reject_proposal)
+        n_applied, errors = apply_all_tracked(filepath, proposals)
 
-        n = len(proposals)
+        # Show results in chat
+        if n_applied:
+            self._append_line(
+                f"[Applied {n_applied} tracked change{'s' if n_applied != 1 else ''}"
+                " — review in LyX (Document > Changes)]"
+            )
+            # Reload LyX buffer to show changes
+            if self._bridge and self._bridge.is_connected():
+                self._bridge.reload_buffer_no_confirm()
+            # Show tracked change bar
+            self._tc_bar.show_changes(n_applied)
+
+        for err in errors:
+            self._append_line(f"[{err}]")
+
+        # Fall back to card UI for proposals that failed tracked-change apply
+        fallback_proposals = [
+            p for i, p in enumerate(proposals)
+            if any(e.startswith(f"Edit {i + 1}:") for e in errors)
+        ]
+        if fallback_proposals:
+            self._edit_panel.show_proposals(fallback_proposals)
+            for card in self._edit_panel._cards:
+                card.accepted.connect(self._apply_proposal_fallback)
+                card.rejected.connect(self._reject_proposal)
+
+        # Refresh context
+        if n_applied:
+            self._refresh_context()
+
         duration = self._engine.last_duration()
         self._status.showMessage(
-            f"{n} edit{'s' if n != 1 else ''} proposed  —  {duration:.0f}s  —  review below"
+            f"{n_applied} tracked change{'s' if n_applied != 1 else ''} applied"
+            f"  —  {duration:.0f}s"
+            + (f"  —  {len(errors)} failed" if errors else "")
         )
 
-    def _apply_proposal(self, proposal):
-        """Apply an accepted edit to disk (or via LyX word-replace for plain text)."""
+    def _apply_proposal_fallback(self, proposal):
+        """Apply a proposal via direct file edit (fallback for tracked-change failures)."""
         project_root = self._doc_manager.get_project_root()
         if not project_root:
             self._append_line("[Error: no project root set — cannot apply edit]")
             return
 
-        # Try word-replace via LyX for plain-text edits (preserves undo stack)
-        if (self._bridge and self._bridge.is_connected()
-                and is_plain_text_edit(proposal.old_text, proposal.new_text)):
-            search = collapse_lyx_wrapping(proposal.old_text)
-            replace = collapse_lyx_wrapping(proposal.new_text)
-            if self._bridge.word_replace(search, replace):
-                self._append_line(f"[Applied edit to {proposal.file_path} via LyX word-replace]")
-                self._bridge.activate()
-                # Refresh context after word-replace
-                current = self._doc_manager.get_path()
-                edited = (project_root / proposal.file_path).resolve()
-                if current and current.resolve() == edited:
-                    QTimer.singleShot(300, self._refresh_context)
-                return
+        # Use real file path, not Claude's invented one
+        filepath = self._doc_manager.get_path()
+        if not filepath:
+            self._append_line("[Error: no document loaded]")
+            return
+        relpath = filepath.relative_to(project_root) if project_root and filepath.is_relative_to(project_root) else filepath.name
 
-        error = apply_edit(project_root, proposal.file_path, proposal.old_text, proposal.new_text)
+        error = apply_edit(project_root, str(relpath), proposal.old_text, proposal.new_text)
         if error is None:
-            self._append_line(f"[Applied edit to {proposal.file_path}]")
-            # Tell LyX to reload from disk
+            self._append_line(f"[Applied edit to {relpath}]")
             if self._bridge and self._bridge.is_connected():
                 self._bridge.reload_buffer()
-                self._bridge.activate()
-            # Refresh context if this is the currently loaded file
-            current = self._doc_manager.get_path()
-            edited = (project_root / proposal.file_path).resolve()
-            if current and current.resolve() == edited:
-                self._refresh_context()
+            self._refresh_context()
         else:
-            self._append_line(f"[Failed to apply edit to {proposal.file_path} — {error}]")
+            self._append_line(f"[Failed to apply edit — {error}]")
 
     def _reject_proposal(self, proposal):
         """Log a rejected edit."""
-        self._append_line(f"[Rejected edit to {proposal.file_path}]")
+        self._append_line(f"[Rejected edit]")
+
+    @Slot()
+    def _on_tc_accept_all(self):
+        """Send all-changes-accept LFUN to LyX."""
+        if self._bridge and self._bridge.is_connected():
+            self._bridge.accept_all_changes()
+            self._append_line("[Accepted all tracked changes in LyX]")
+            QTimer.singleShot(500, self._refresh_context)
+        else:
+            self._append_line("[Error: LyX not connected — accept changes manually in LyX]")
+
+    @Slot()
+    def _on_tc_reject_all(self):
+        """Send all-changes-reject LFUN to LyX."""
+        if self._bridge and self._bridge.is_connected():
+            self._bridge.reject_all_changes()
+            self._append_line("[Rejected all tracked changes in LyX]")
+            QTimer.singleShot(500, self._refresh_context)
+        else:
+            self._append_line("[Error: LyX not connected — reject changes manually in LyX]")
 
     @Slot(str)
     def _on_parse_debug(self, msg: str):

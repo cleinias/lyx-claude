@@ -221,6 +221,18 @@ class LyXBridge(QObject):
         """Tell LyX to reload the current buffer from disk."""
         return self.send_command("buffer-reload") is not None
 
+    def reload_buffer_no_confirm(self) -> bool:
+        """Tell LyX to reload the current buffer without confirmation dialog."""
+        return self.send_command("buffer-reload", "dump") is not None
+
+    def accept_all_changes(self) -> bool:
+        """Accept all tracked changes in the current buffer."""
+        return self.send_command("all-changes-accept") is not None
+
+    def reject_all_changes(self) -> bool:
+        """Reject all tracked changes in the current buffer."""
+        return self.send_command("all-changes-reject") is not None
+
     def insert_text(self, text: str) -> bool:
         """Insert *text* at the current cursor position in LyX."""
         return self.send_command("self-insert", text) is not None

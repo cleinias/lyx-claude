@@ -7,7 +7,7 @@ import time
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
-from .edits import EditProposal, parse_proposals
+from .edits import EditProposal, parse_proposals, strip_change_markers
 
 
 SYSTEM_PROMPT = """\
@@ -51,7 +51,8 @@ the source, even if words are split across lines.
 
 Your Edit and Write tools are disabled.  The ONLY way to modify files is by
 outputting proposed-edit blocks in your response text.  The sidecar app parses
-these blocks and shows the user an Accept/Reject panel automatically.
+these blocks and applies them as tracked changes in LyX for the user to review
+using LyX's built-in Track Changes interface (Document > Changes).
 
 CRITICAL RULES — you MUST follow all of these:
 - ALWAYS output the blocks directly when you want to suggest changes.
@@ -61,6 +62,9 @@ CRITICAL RULES — you MUST follow all of these:
 - NEVER wrap the blocks in markdown code fences (no ```).
 - NEVER refer to the blocks as "XML" or discuss their syntax.
 - Briefly describe what you are changing in plain language, then output the blocks.
+- If the document contains \\change_inserted, \\change_deleted, or
+  \\change_unchanged markers, IGNORE them when writing <old> text — they are
+  tracking metadata, not part of the prose.
 
 Format (one block per edit, raw in your response text, not in code fences):
 
@@ -141,7 +145,8 @@ class ConversationEngine(QObject):
             system += f"\n\n## Current document\n\nFilename: `{self._document_relpath}`\n"
             system += "Use this EXACT path in the `file` attribute of every proposed-edit block.\n"
         if self._document_content:
-            doc = self._document_content
+            # Strip tracked-change markers so Claude sees clean content
+            doc = strip_change_markers(self._document_content)
             if len(doc) > 300_000:
                 doc = doc[:300_000] + "\n\n[... document truncated ...]"
             system += f"\n\n---\n\n## Raw LyX markup\n\n{doc}"
